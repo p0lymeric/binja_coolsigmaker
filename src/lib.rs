@@ -28,6 +28,7 @@ use std::sync::atomic::AtomicUsize;
 use std::time::SystemTime;
 
 use binary_search::{Direction, binary_search};
+use binaryninja::binary_view::search::SearchQuery;
 use binaryninja::{
     architecture::Architecture,
     binary_view::{BinaryView, BinaryViewBase, BinaryViewExt},
@@ -434,17 +435,38 @@ fn find_patterns<'a>(
         .flatten()
 }
 
-fn is_pattern_unique(code_segments: &[(u64, Vec<u8>)], pattern: Pattern) -> bool {
-    let iter = find_patterns(code_segments, pattern);
+fn is_pattern_unique(code_segments: &[(u64, Vec<u8>)], pattern: Pattern, bv: &BinaryView) -> bool {
+    // let iter = find_patterns(code_segments, pattern);
 
-    let count = AtomicUsize::new(0);
+    // let count = AtomicUsize::new(0);
 
-    iter.find_any(|_| {
-        count.fetch_add(1, Ordering::Relaxed);
-        count.load(Ordering::Relaxed) > 1
+    // iter.find_any(|_| {
+    //     count.fetch_add(1, Ordering::Relaxed);
+    //     count.load(Ordering::Relaxed) > 1
+    // });
+
+    // let final_count = count.load(Ordering::Relaxed);
+
+    // tracing::error!("{}", final_count);
+
+    // count.load(Ordering::Relaxed) == 1
+
+    let pattern_string = pattern
+        .iter()
+        .map(|maybe_b| match maybe_b {
+            Some(b) => format!("{:02X}", b).to_string(),
+            None => "??".to_string()
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+    ;
+
+    let mut count = 0;
+    bv.search(&SearchQuery::new(pattern_string), |_addr, _data_buffer| {
+        count += 1;
+        true
     });
-
-    count.load(Ordering::Relaxed) == 1
+    count == 1
 }
 
 fn create_pattern_internal_binarysearch(
@@ -558,7 +580,7 @@ fn create_pattern_internal_binarysearch(
             #[cfg(debug_assertions)]
             tracing::info!("{}", RustPattern(Cow::Borrowed(&pat.to_vec())));
 
-            match is_pattern_unique(&data, pat) {
+            match is_pattern_unique(&data, pat, bv) {
                 false => Direction::Low(()),
                 true => Direction::High(()),
             }
@@ -681,7 +703,7 @@ fn create_pattern_internal(
         current_pattern.extend(&instr_pattern);
 
         current_offset += instr.len() as u64;
-        pattern_unique = is_pattern_unique(&data, &current_pattern);
+        pattern_unique = is_pattern_unique(&data, &current_pattern, bv);
     }
 
     while let Some(x) = current_pattern.last()
@@ -742,7 +764,7 @@ fn create_pattern(bv: &BinaryView, addr: u64) -> Result<OwnedPattern, SignatureE
 
     if pattern
         .as_ref()
-        .is_ok_and(|pat| !is_pattern_unique(&data, &pat))
+        .is_ok_and(|pat| !is_pattern_unique(&data, &pat, bv))
     {
         tracing::error!("signature not unique, cannot proceed!");
         return Err(SignatureError::NotUnique(
