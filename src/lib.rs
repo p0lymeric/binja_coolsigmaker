@@ -42,6 +42,7 @@ use iced_x86::{
     ConstantOffsets, FlowControl, Formatter, Instruction, NasmFormatter, OpKind,
 };
 use rayon::prelude::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
+use serde_json::json;
 use strum::{Display, EnumIter, EnumMessage, EnumString, IntoEnumIterator, VariantNames};
 
 type OwnedPattern = Vec<Option<u8>>;
@@ -799,28 +800,24 @@ fn register_settings() {
         description: &str,
         typ: &str,
         default: T,
+        extra_properties: &[(&str, &serde_json::Value)],
     ) where
-        T: core::fmt::Display,
+        T: core::fmt::Display + serde::Serialize,
     {
-        let default = if typ == "string" {
-            format!("\"{}\"", default)
-        } else {
-            format!("{}", default)
-        };
+        let mut properties_val = json!({
+            "title": title,
+            "type": typ,
+            "default": default,
+            "description": description,
+            "ignore": ["SettingsProjectScope", "SettingsResourceScope"],
+        });
 
-        let properties = format!(
-            r#"
-		{{
-			"title": "{title}",
-			"type": "{typ}",
-			"default": {default},
-			"description": "{description}",
-			"ignore": ["SettingsProjectScope", "SettingsResourceScope"]
-		}}
-		"#
-        );
+        let properties = properties_val.as_object_mut().unwrap();
+        for (key, val) in extra_properties {
+            properties.insert(key.to_string(), (*val).clone());
+        }
 
-        settings.register_setting_json(name, &properties);
+        settings.register_setting_json(name, &properties_val.to_string());
     }
 
     fn register_enum_setting<T>(settings: &Settings, name: &str, title: &str, description: &str)
@@ -863,6 +860,7 @@ fn register_settings() {
         "Include immediate operands that aren't memory-relative or relocated when creating signatures. This results in smaller, but potentially more fragile, signatures. If no unique signature can be generated without operands, we fall back to including them.",
         "boolean",
         false,
+        &[],
     );
 
     register_setting::<bool>(
@@ -872,6 +870,7 @@ fn register_settings() {
         "Use a binary search to determine instruction uniqueness. For small binaries, this will be slower than the default, while for bigger binaries it might be faster. It starts scanning at half the maximum signature size. There is no heuristic implemented to automatically determine this yet.",
         "boolean",
         false,
+        &[],
     );
 
     register_setting::<u64>(
@@ -881,6 +880,11 @@ fn register_settings() {
         "The maximum size the signature will accumulate before giving up.",
         "number",
         64,
+        &[
+            ("minValue", &json!(0)),
+            // i32::MAX is one before when the widget changes from a spinner to a hex input box
+            ("maxValue", &json!(i32::MAX)),
+        ],
     );
 
     register_enum_setting::<SignatureType>(
