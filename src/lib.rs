@@ -19,12 +19,13 @@
 //!
 
 #![feature(iter_array_chunks)]
-use std::{borrow::Cow, sync::atomic::Ordering};
+use std::borrow::Cow;
+// use std::sync::atomic::Ordering;
 
 use std::fmt::Display;
 use std::ops::Range;
 use std::str::FromStr;
-use std::sync::atomic::AtomicUsize;
+// use std::sync::atomic::AtomicUsize;
 use std::time::SystemTime;
 
 use binary_search::{Direction, binary_search};
@@ -37,12 +38,14 @@ use binaryninja::{
 };
 
 use clipboard::ClipboardProvider;
-use coolfindpattern::PatternSearcher;
+// use coolfindpattern::PatternSearcher;
 use iced_x86::{
     Code::{DeclareByte, DeclareDword, DeclareQword, DeclareWord},
     ConstantOffsets, FlowControl, Formatter, Instruction, NasmFormatter, OpKind,
 };
-use rayon::prelude::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
+// use rayon::prelude::IntoParallelRefIterator;
+// use rayon::prelude::ParallelBridge;
+use rayon::prelude::ParallelIterator;
 use serde_json::json;
 use strum::{Display, EnumIter, EnumMessage, EnumString, IntoEnumIterator, VariantNames};
 
@@ -415,27 +418,47 @@ fn get_instruction_pattern(
 }
 
 fn find_patterns<'a>(
-    code_segments: &'a [(u64, Vec<u8>)],
+    _code_segments: &'a [(u64, Vec<u8>)],
     pattern: Pattern<'a>,
+    bv: &BinaryView,
 ) -> impl ParallelIterator<Item = u64> + 'a {
-    fn find_patterns_internal<'a>(
-        region: &'a [u8],
-        pattern: Pattern<'a>,
-    ) -> impl Iterator<Item = usize> + 'a {
-        PatternSearcher::new(region, pattern)
-    }
+    // fn find_patterns_internal<'a>(
+    //     region: &'a [u8],
+    //     pattern: Pattern<'a>,
+    // ) -> impl Iterator<Item = usize> + 'a {
+    //     PatternSearcher::new(region, pattern)
+    // }
 
-    code_segments
-        .par_iter()
-        .map(|segment| {
-            find_patterns_internal(&segment.1, pattern)
-                .map(|x| x as u64 + segment.0)
-                .par_bridge()
+    // code_segments
+    //     .par_iter()
+    //     .map(|segment| {
+    //         find_patterns_internal(&segment.1, pattern)
+    //             .map(|x| x as u64 + segment.0)
+    //             .par_bridge()
+    //     })
+    //     .flatten()
+
+    // FIXME coolfindpattern appears to return incorrect results
+    // WA is to use bv.search with a FlexHex string
+    let pattern_string = pattern
+        .iter()
+        .map(|maybe_b| match maybe_b {
+            Some(b) => format!("{:02X}", b).to_string(),
+            None => "??".to_string()
         })
-        .flatten()
+        .collect::<Vec<String>>()
+        .join(" ")
+    ;
+
+    let mut results = vec![];
+    bv.search(&SearchQuery::new(pattern_string), |addr, _data_buffer| {
+        results.push(addr);
+        true
+    });
+    rayon::iter::IntoParallelIterator::into_par_iter(results)
 }
 
-fn is_pattern_unique(code_segments: &[(u64, Vec<u8>)], pattern: Pattern, bv: &BinaryView) -> bool {
+fn is_pattern_unique(_code_segments: &[(u64, Vec<u8>)], pattern: Pattern, bv: &BinaryView) -> bool {
     // let iter = find_patterns(code_segments, pattern);
 
     // let count = AtomicUsize::new(0);
@@ -445,12 +468,10 @@ fn is_pattern_unique(code_segments: &[(u64, Vec<u8>)], pattern: Pattern, bv: &Bi
     //     count.load(Ordering::Relaxed) > 1
     // });
 
-    // let final_count = count.load(Ordering::Relaxed);
-
-    // tracing::error!("{}", final_count);
-
     // count.load(Ordering::Relaxed) == 1
 
+    // FIXME coolfindpattern appears to return incorrect results
+    // WA is to use bv.search with a FlexHex string
     let pattern_string = pattern
         .iter()
         .map(|maybe_b| match maybe_b {
@@ -990,7 +1011,7 @@ impl Command for SigFinderCommand {
             return;
         };
 
-        find_patterns(&data, &pattern)
+        find_patterns(&data, &pattern, bv)
             .for_each(|occurrence| tracing::info!("found signature at {:#04X}", occurrence));
 
         tracing::info!(
