@@ -34,7 +34,7 @@ use binaryninja::segment::Segment;
 use binaryninja::{
     architecture::Architecture,
     binary_view::{BinaryView, BinaryViewBase, BinaryViewExt},
-    command::{self, AddressCommand, Command},
+    command::{self, Command, RangeCommand},
     settings::Settings,
 };
 
@@ -52,6 +52,12 @@ use strum::{Display, EnumIter, EnumMessage, EnumString, IntoEnumIterator, Varian
 
 type OwnedPattern = Vec<Option<u8>>;
 type Pattern<'a> = &'a [Option<u8>];
+
+#[derive(PartialEq, Debug)]
+struct CreatePatternValue {
+    unique_spanning_size: usize,
+    pattern: OwnedPattern,
+}
 
 #[derive(EnumIter, VariantNames, EnumMessage, EnumString, Display)]
 enum SignatureType {
@@ -74,7 +80,7 @@ impl Default for SignatureType {
 struct SigMakerCommand;
 struct SigFinderCommand;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(PartialEq, thiserror::Error, Debug)]
 enum SignatureError {
     #[error(
         "pattern is not unique even at size of {0} bytes! we either hit the limit or would have broken a function boundary."
@@ -573,12 +579,27 @@ enum SearchStrategyKind {
 
 fn create_pattern_internal(
     bv: &BinaryView,
-    addr: u64,
+    range: &Range<u64>,
     data: &[(u64, Vec<u8>)],
     include_operands: bool,
     search_strategy: SearchStrategyKind,
-) -> Result<OwnedPattern, SignatureError> {
+) -> Result<CreatePatternValue, SignatureError> {
     let time = SystemTime::now();
+
+    let include_all_selected_instructions = get_include_all_selected_instructions(bv);
+
+    // Patterns are constructed in three phases:
+    // Phase I: Get the minimum pattern from range.start to uniquely identify the location in the executable. This is the minimum unique signature.
+    // Phase II: Extend the minimum pattern until it covers [range.start, range.end - 1]. This is the minimum unique spanning signature.
+    // Phase III: Extend the pattern until it is at least min_size wide or a function boundary is reached. This is the minimum size signature.
+
+    let (addr, selection_size) = if include_all_selected_instructions {
+        tracing::info!("creating pattern for address {:#04X}..={:#04X}", range.start, range.end - 1);
+        (range.start, range.end - range.start)
+    } else {
+        tracing::info!("creating pattern for address {:#04X}", range.start);
+        (range.start, 1)
+    };
 
     let mut formatter = NasmFormatter::new();
     formatter.options_mut().set_rip_relative_addresses(true);
@@ -588,6 +609,7 @@ fn create_pattern_internal(
     let mut current_offset = 0u64;
     let mut current_pattern = OwnedPattern::default();
 
+    let min_size = get_minimum_signature_size(bv);
     let max_size = get_maximum_signature_size(bv);
 
     let Some(start_segment) = bv.segment_at(addr as u64) else {
@@ -602,6 +624,7 @@ fn create_pattern_internal(
     #[cfg(debug_assertions)]
     tracing::info!("max sig size: {max_size}");
 
+    // Phase I
     match search_strategy {
         SearchStrategyKind::LinearSearch => {
             let mut pattern_unique = false;
@@ -619,8 +642,9 @@ fn create_pattern_internal(
             }
         },
         SearchStrategyKind::BinarySearch => {
-            // This algorithm will currently load all instructions up to maximum_signature_size before performing filtering
-            // It could possibly be improved by only preloading ~32 bytes and to dynamically fill during bisection as needed
+            // This algorithm will currently load all instructions up to maximum_signature_size before performing filtering,
+            // which unnecessarily hurts performance with large values of maximum_signature_size
+            // It could possibly be improved by preloading ~32 bytes and dynamically filling current_pattern during bisection as needed
 
             let mut instr_offsets = vec![];
 
@@ -652,43 +676,82 @@ fn create_pattern_internal(
 
             let instr = instr_offsets[unique_instr.clamp(0, instr_offsets.len() - 1)];
 
+            // FIXME slightly wasteful as phase II and III could add these instructions again
             current_offset = instr.0 + instr.1 as u64;
             current_pattern.drain(current_offset as usize..);
         },
     }
 
+    // Phase II
+    while current_pattern.len() < selection_size as usize {
+        if let Some(instr_pattern) = yield_next_instruction(
+            bv, addr, current_offset, data_segment, &start_segment, max_size, &relocations, &mut formatter, include_operands,
+        )? {
+            current_pattern.extend(&instr_pattern);
+            current_offset += instr_pattern.len() as u64;
+        } else {
+            break;
+        }
+    }
+
+    let remove_terminal_wildcards = get_remove_terminal_wildcards(bv);
+
+    // Compute minimum unique spanning size, adjusting for the fact this implementation strips trailing wildcards
+    let unique_spanning_size = if remove_terminal_wildcards {
+        current_pattern
+            .iter()
+            .rposition(|x| x.is_some())
+            .map_or(0, |i| i + 1)
+    } else {
+        current_pattern.len()
+    };
+
+    // Phase III
+    while current_pattern.len() < min_size as usize {
+        if let Some(instr_pattern) = yield_next_instruction(
+            bv, addr, current_offset, data_segment, &start_segment, max_size, &relocations, &mut formatter, include_operands,
+        )? {
+            current_pattern.extend(&instr_pattern);
+            current_offset += instr_pattern.len() as u64;
+        } else {
+            break;
+        }
+    }
+
     // Strip trailing None from the final pattern
-    while let Some(x) = current_pattern.last()
-        && x.is_none()
-    {
-        current_pattern.pop();
+    if remove_terminal_wildcards {
+        while let Some(x) = current_pattern.last()
+            && x.is_none()
+        {
+            current_pattern.pop();
+        }
     }
 
     tracing::info!(
-        "created pattern in {}ms",
-        SystemTime::now().duration_since(time).unwrap().as_millis()
+        "{} created pattern in {}ms",
+        search_strategy.to_string().to_lowercase(), SystemTime::now().duration_since(time).unwrap().as_millis()
     );
 
-    Ok(current_pattern)
+    Ok(CreatePatternValue { unique_spanning_size, pattern: current_pattern })
 }
 
-fn create_pattern(bv: &BinaryView, addr: u64) -> Result<OwnedPattern, SignatureError> {
+fn create_pattern(bv: &BinaryView, range: &Range<u64>) -> Result<CreatePatternValue, SignatureError> {
     let include_operands = get_include_operands(bv);
     let data = get_code(bv);
 
     #[cfg(debug_assertions)]
     {
-        let pattern = create_pattern_internal(bv, addr, &data, include_operands, SearchStrategyKind::LinearSearch);
+        let pattern = create_pattern_internal(bv, range, &data, include_operands, SearchStrategyKind::LinearSearch);
         let binsearch_pattern =
-            create_pattern_internal(bv, addr, &data, include_operands, SearchStrategyKind::BinarySearch);
+            create_pattern_internal(bv, range, &data, include_operands, SearchStrategyKind::BinarySearch);
 
         let _ = pattern
             .as_ref()
-            .map(|pat| tracing::info!("{}", RustPattern(Cow::Borrowed(&pat))));
+            .map(|pat| tracing::info!("{}", RustPattern(Cow::Borrowed(&pat.pattern))));
 
         let _ = binsearch_pattern
             .as_ref()
-            .map(|pat| tracing::info!("{}", RustPattern(Cow::Borrowed(&pat))));
+            .map(|pat| tracing::info!("{}", RustPattern(Cow::Borrowed(&pat.pattern))));
 
         if pattern.as_ref().unwrap() != binsearch_pattern.as_ref().unwrap() {
             tracing::error!("patterns dont match :(((");
@@ -696,9 +759,9 @@ fn create_pattern(bv: &BinaryView, addr: u64) -> Result<OwnedPattern, SignatureE
     }
 
     let pattern = if get_binary_search(bv) {
-        create_pattern_internal(bv, addr, &data, include_operands, SearchStrategyKind::BinarySearch)
+        create_pattern_internal(bv, range, &data, include_operands, SearchStrategyKind::BinarySearch)
     } else {
-        create_pattern_internal(bv, addr, &data, include_operands, SearchStrategyKind::LinearSearch)
+        create_pattern_internal(bv, range, &data, include_operands, SearchStrategyKind::LinearSearch)
     };
 
     let pattern = if !include_operands && matches!(pattern, Err(SignatureError::NotUnique(_))) {
@@ -706,9 +769,9 @@ fn create_pattern(bv: &BinaryView, addr: u64) -> Result<OwnedPattern, SignatureE
             "unable to find a unique pattern that didn't include operands. trying again with operands!"
         );
         if get_binary_search(bv) {
-            create_pattern_internal(bv, addr, &data, true, SearchStrategyKind::BinarySearch)
+            create_pattern_internal(bv, range, &data, true, SearchStrategyKind::BinarySearch)
         } else {
-            create_pattern_internal(bv, addr, &data, true, SearchStrategyKind::LinearSearch)
+            create_pattern_internal(bv, range, &data, true, SearchStrategyKind::LinearSearch)
         }
     } else {
         pattern
@@ -716,11 +779,11 @@ fn create_pattern(bv: &BinaryView, addr: u64) -> Result<OwnedPattern, SignatureE
 
     if pattern
         .as_ref()
-        .is_ok_and(|pat| !is_pattern_unique(&data, &pat, bv))
+        .is_ok_and(|pat| !is_pattern_unique(&data, &pat.pattern, bv))
     {
         tracing::error!("signature not unique, cannot proceed!");
         return Err(SignatureError::NotUnique(
-            pattern.map_or(0u64, |pat| pat.len() as u64),
+            pattern.map_or(0u64, |pat| pat.pattern.len() as u64),
         ));
     }
 
@@ -746,8 +809,16 @@ fn get_clipboard_contents() -> Result<String, Box<dyn std::error::Error>> {
     ctx.get_contents()
 }
 
+fn get_minimum_signature_size(_bv: &BinaryView) -> u64 {
+    Settings::new().get_integer("coolsigmaker.minimum_size")
+}
+
 fn get_maximum_signature_size(_bv: &BinaryView) -> u64 {
     Settings::new().get_integer("coolsigmaker.maximum_size")
+}
+
+fn get_include_all_selected_instructions(_bv: &BinaryView) -> bool {
+    Settings::new().get_bool("coolsigmaker.include_all_selected_instructions")
 }
 
 fn get_include_operands(_bv: &BinaryView) -> bool {
@@ -756,6 +827,10 @@ fn get_include_operands(_bv: &BinaryView) -> bool {
 
 fn get_binary_search(_bv: &BinaryView) -> bool {
     Settings::new().get_bool("coolsigmaker.binary_search")
+}
+
+fn get_remove_terminal_wildcards(_bv: &BinaryView) -> bool {
+    Settings::new().get_bool("coolsigmaker.remove_terminal_wildcards")
 }
 
 fn get_signature_type(_bv: &BinaryView) -> SignatureType {
@@ -829,6 +904,16 @@ fn register_settings() {
 
     register_setting::<bool>(
         &settings,
+        "coolsigmaker.include_all_selected_instructions",
+        "Include All Selected Instructions",
+        "When enabled, the signature includes all instructions in a ranged selection. When disabled, only includes the first instruction in a selection.",
+        "boolean",
+        true,
+        &[],
+    );
+
+    register_setting::<bool>(
+        &settings,
         "coolsigmaker.include_operands",
         "Include Operands",
         "Include immediate operands that aren't memory-relative or relocated when creating signatures. This results in smaller, but potentially more fragile, signatures. If no unique signature can be generated without operands, we fall back to including them.",
@@ -859,6 +944,30 @@ fn register_settings() {
             // i32::MAX is one before when the widget changes from a spinner to a hex input box
             ("maxValue", &json!(i32::MAX)),
         ],
+    );
+
+    register_setting::<u64>(
+        &settings,
+        "coolsigmaker.minimum_size",
+        "Minimum Signature Size",
+        "The minimum size the signature will accumulate. Signatures are constructed to uniquely span the selection, then extended until they reach minimum size or the function boundary.",
+        "number",
+        0,
+        &[
+            ("minValue", &json!(0)),
+            // i32::MAX is one before when the widget changes from a spinner to a hex input box
+            ("maxValue", &json!(i32::MAX))
+        ],
+    );
+
+    register_setting::<bool>(
+        &settings,
+        "coolsigmaker.remove_terminal_wildcards",
+        "Remove Terminal Wildcards",
+        "When enabled, removes any wildcards at the end of a generated signature. When disabled, a signature always ends on an instruction boundary.",
+        "boolean",
+        true,
+        &[],
     );
 
     register_enum_setting::<SignatureType>(
@@ -901,17 +1010,24 @@ fn test_patterns() {
     );
 }
 
-impl AddressCommand for SigMakerCommand {
-    fn action(&self, bv: &BinaryView, addr: u64) {
-        match create_pattern(bv, addr as _) {
-            Ok(pattern) => {
+impl RangeCommand for SigMakerCommand {
+    fn action(&self, bv: &BinaryView, range: Range<u64>) {
+        match create_pattern(bv, &range) {
+            Ok(create_pattern_value) => {
+                let pattern_len = create_pattern_value.pattern.len();
+
                 let pattern: Box<dyn core::fmt::Display> = match get_signature_type(bv) {
-                    SignatureType::IDAOne => Box::new(IDAOnePattern(Cow::Owned(pattern))),
-                    SignatureType::IDATwo => Box::new(IDATwoPattern(Cow::Owned(pattern))),
-                    SignatureType::Rust => Box::new(RustPattern(Cow::Owned(pattern))),
-                    SignatureType::CStr => Box::new(CStrPattern(Cow::Owned(pattern))),
+                    SignatureType::IDAOne => Box::new(IDAOnePattern(Cow::Owned(create_pattern_value.pattern))),
+                    SignatureType::IDATwo => Box::new(IDATwoPattern(Cow::Owned(create_pattern_value.pattern))),
+                    SignatureType::Rust => Box::new(RustPattern(Cow::Owned(create_pattern_value.pattern))),
+                    SignatureType::CStr => Box::new(CStrPattern(Cow::Owned(create_pattern_value.pattern))),
                 };
 
+                if create_pattern_value.unique_spanning_size != pattern_len {
+                    tracing::info!("minimum unique spanning length is {} bytes, extended to {} bytes", create_pattern_value.unique_spanning_size, pattern_len);
+                } else {
+                    tracing::info!("minimum unique spanning length is {} bytes", create_pattern_value.unique_spanning_size);
+                }
                 emit_result(format!("{}", pattern));
             }
             Err(e) => {
@@ -920,9 +1036,11 @@ impl AddressCommand for SigMakerCommand {
         }
     }
 
-    fn valid(&self, bv: &BinaryView, addr: u64) -> bool {
-        // there is a function at the specified address. the pattern creation code will make sure we stay within a valid function.
-        !bv.functions_containing(addr).is_empty()
+    fn valid(&self, bv: &BinaryView, range: Range<u64>) -> bool {
+        // assert there is a function at the specified range start, otherwise disable the menu option.
+        // the pattern creation process will make sure we stay within a valid function
+        // within the range and past range.end.
+        !bv.functions_containing(range.start).is_empty()
     }
 }
 
@@ -984,7 +1102,7 @@ pub extern "C" fn CorePluginInit() -> bool {
 
     register_settings();
 
-    command::register_command_for_address(
+    command::register_command_for_range(
         "CSM - Create Signature from Address",
         "Creates a Signature from the currently selected address",
         SigMakerCommand {},
