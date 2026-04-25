@@ -335,72 +335,54 @@ fn get_instruction_pattern(
     let buf_instr = &buf[..instr.len()];
     let mut pattern = buf_instr.into_iter().map(|x| Some(*x)).collect::<OwnedPattern>();
 
-    #[allow(unused_parens)]
-    if instr.is_invalid()
-        || matches!(
-            instr.code(),
-            (DeclareByte | DeclareWord | DeclareDword | DeclareQword)
-        )
-    {
+    if instr.is_invalid() || matches!(
+        instr.code(),
+        DeclareByte | DeclareWord | DeclareDword | DeclareQword
+    ) {
         Err(SignatureError::InvalidInstruction)?
     }
 
-    #[allow(unused_parens)]
-    let is_branch = matches!(
-        instr.flow_control(),
-        (FlowControl::Call
-            | FlowControl::ConditionalBranch
-            | FlowControl::IndirectBranch
-            | FlowControl::IndirectCall
-            | FlowControl::UnconditionalBranch)
-    );
-
-    if offsets.has_displacement() {
-        for x in offsets.displacement_offset()
-            ..offsets.displacement_offset() + offsets.displacement_size()
-        {
-            pattern[x] = None;
-        }
-    }
-
-    // 0x10000000 constants here are what iced-x86 bases its disassembly on.
-
-    if !include_operands && offsets.has_immediate() {
-        let branch_target = instr
-            .op_kinds()
-            .filter_map(|kind| match kind {
-                OpKind::FarBranch16 => Some(instr.far_branch16() as u64 + bv.start() - 0x10000000),
-                OpKind::FarBranch32 => Some(instr.far_branch32() as u64 + bv.start() - 0x10000000),
-                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
-                    Some(instr.near_branch_target())
-                }
-                _ => None,
-            })
-            .nth(0);
-
-        if is_branch && branch_target.is_some_and(|branch_target| bv.offset_valid(branch_target)) {
-            for x in
-                offsets.immediate_offset()..offsets.immediate_offset() + offsets.immediate_size()
+    // Mask RIP-relative displacements that land on data
+    // Based off Sigga's maskOperandsSmart
+    if !include_operands && offsets.has_displacement() {
+        // TODO does this need to be varianted for x86/x86-64?
+        // RIP is set to be based on BN's basis instead of iced-x86's default basis
+        let target = instr.memory_displacement64();
+        // tracing::info!("displacement to {:x}", target);
+        if bv.offset_valid(target) & !bv.offset_executable(target) {
+            for x in offsets.displacement_offset()
+                ..offsets.displacement_offset() + offsets.displacement_size()
             {
                 pattern[x] = None;
             }
         }
     }
 
-    if !include_operands && offsets.has_immediate2() {
-        let branch_target = instr
-            .op_kinds()
-            .filter_map(|kind| match kind {
-                OpKind::FarBranch16 => Some(instr.far_branch16() as u64 + bv.start() - 0x10000000),
-                OpKind::FarBranch32 => Some(instr.far_branch32() as u64 + bv.start() - 0x10000000),
-                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
-                    Some(instr.near_branch_target())
+    // Mask large immediates (>64 kiB) that land on data
+    // Based off Sigga's maskOperandsSmart
+    if !include_operands && (offsets.has_immediate() || offsets.has_immediate2()) {
+        // tracing::info!("has immediate");
+        let replace_imm = (0..instr.op_count()).any(|i| {
+            if let Ok(imm) = instr.try_immediate(i as u32) {
+                if imm > 0x10000 {
+                    // tracing::info!("large immediate referencing {:x}", target);
+                    if bv.offset_valid(imm) & !bv.offset_executable(imm) {
+                        return true;
+                    }
                 }
-                _ => None,
-            })
-            .nth(0);
+            }
+            return false;
+        });
 
-        if is_branch && branch_target.is_some_and(|branch_target| bv.offset_valid(branch_target)) {
+        if replace_imm && offsets.has_immediate() {
+            for x in
+                offsets.immediate_offset()..offsets.immediate_offset() + offsets.immediate_size()
+            {
+                pattern[x] = None;
+            }
+        }
+
+        if replace_imm && offsets.has_immediate2()  {
             for x in
                 offsets.immediate_offset2()..offsets.immediate_offset2() + offsets.immediate_size2()
             {
@@ -409,6 +391,35 @@ fn get_instruction_pattern(
         }
     }
 
+    // Mask all call/uncond jump/cond branch targets
+    let is_branch = matches!(
+        instr.flow_control(),
+        FlowControl::Call
+        | FlowControl::ConditionalBranch
+        | FlowControl::IndirectBranch
+        | FlowControl::IndirectCall
+        | FlowControl::UnconditionalBranch
+    );
+    if is_branch {
+        // iced-x86 may compute the offsets on a different basis than BN, but we don't need to know its computation
+        if offsets.has_immediate() {
+            for x in
+                offsets.immediate_offset()..offsets.immediate_offset() + offsets.immediate_size()
+            {
+                pattern[x] = None;
+            }
+        }
+
+        if offsets.has_immediate2()  {
+            for x in
+                offsets.immediate_offset2()..offsets.immediate_offset2() + offsets.immediate_size2()
+            {
+                pattern[x] = None;
+            }
+        }
+    }
+
+    // Mask offsets that are targeted by the relocation table
     let start_addr = start_addr as usize;
     for relocation in relocations {
         if (start_addr..(start_addr + instr.len())).contains(&(relocation.start as usize)) {
