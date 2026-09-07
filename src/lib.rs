@@ -33,7 +33,7 @@ use binaryninja::binary_view::search::SearchQuery;
 use binaryninja::segment::Segment;
 use binaryninja::{
     architecture::Architecture,
-    binary_view::{BinaryView, BinaryViewBase, BinaryViewExt},
+    binary_view::{BinaryView, BinaryViewBase},
     command::{self, Command, RangeCommand},
     settings::Settings,
 };
@@ -42,7 +42,7 @@ use clipboard::ClipboardProvider;
 // use coolfindpattern::PatternSearcher;
 use iced_x86::{
     Code::{DeclareByte, DeclareDword, DeclareQword, DeclareWord},
-    ConstantOffsets, FlowControl, Formatter, Instruction, NasmFormatter, OpKind,
+    ConstantOffsets, FlowControl, Formatter, Instruction, NasmFormatter,
 };
 // use rayon::prelude::IntoParallelRefIterator;
 // use rayon::prelude::ParallelBridge;
@@ -821,31 +821,31 @@ fn get_clipboard_contents() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn get_minimum_signature_size(_bv: &BinaryView) -> u64 {
-    Settings::new().get_integer("coolsigmaker.minimum_size")
+    Settings::global().get_integer("coolsigmaker.minimum_size")
 }
 
 fn get_maximum_signature_size(_bv: &BinaryView) -> u64 {
-    Settings::new().get_integer("coolsigmaker.maximum_size")
+    Settings::global().get_integer("coolsigmaker.maximum_size")
 }
 
 fn get_include_all_selected_instructions(_bv: &BinaryView) -> bool {
-    Settings::new().get_bool("coolsigmaker.include_all_selected_instructions")
+    Settings::global().get_bool("coolsigmaker.include_all_selected_instructions")
 }
 
 fn get_include_operands(_bv: &BinaryView) -> bool {
-    Settings::new().get_bool("coolsigmaker.include_operands")
+    Settings::global().get_bool("coolsigmaker.include_operands")
 }
 
 fn get_binary_search(_bv: &BinaryView) -> bool {
-    Settings::new().get_bool("coolsigmaker.binary_search")
+    Settings::global().get_bool("coolsigmaker.binary_search")
 }
 
 fn get_remove_terminal_wildcards(_bv: &BinaryView) -> bool {
-    Settings::new().get_bool("coolsigmaker.remove_terminal_wildcards")
+    Settings::global().get_bool("coolsigmaker.remove_terminal_wildcards")
 }
 
 fn get_signature_type(_bv: &BinaryView) -> SignatureType {
-    SignatureType::from_str(Settings::new().get_string("coolsigmaker.sig_type").as_str())
+    SignatureType::from_str(Settings::global().get_string("coolsigmaker.sig_type").as_str())
         .map_err(|_| {
             tracing::error!("invalid value for coolsigmaker.sig_type! falling back to default!")
         })
@@ -909,7 +909,7 @@ fn register_settings() {
         settings.register_setting_json(name, &properties);
     }
 
-    let settings = Settings::new();
+    let settings = Settings::global();
 
     settings.register_group("coolsigmaker", "CoolSigMaker");
 
